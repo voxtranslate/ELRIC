@@ -7,143 +7,116 @@ import random
 import numpy as np
 import os
 
-# Allow loading of truncated images
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+class ImageDataset(Dataset):
+    """Training dataset. Strict enforcement of 0-1 range and NO synthetic data generation."""
+    EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
-class SuperLowDataset(Dataset):
-    def __init__(self, root_dir, split='train', patch_size=256, scale_factor=4):
-        """
-        Dataset for super-resolution training/validation
+    def __init__(self, root_dir, cfg: Dict[str, Any], mode="train"):
+        super().__init__()
+        self.patch_size = cfg["patch_size"]
+        self.mode       = mode
+        self.paths      = self._collect(root_dir)
         
-        Args:
-            root_dir: Root directory containing high-resolution images
-            split: 'train' or 'val'
-            patch_size: Size of high-resolution training patches (only used during training)
-            scale_factor: Downsampling factor for creating low-resolution images
-        """
-        self.root_dir = Path(root_dir)
-        self.split = split
-        self.patch_size = patch_size
-        self.scale_factor = scale_factor
-        self.lr_patch_size = patch_size // scale_factor
+        if not self.paths:
+            raise RuntimeError(f"No valid images found in {root_dir}. Synthetic data generation is strictly forbidden.")
         
-        # Get high-resolution images with multiple extensions
-        self.hr_dir = self.root_dir
-        
-        # Common image extensions
-        self.extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp']
-        
-        # Get all high-resolution images
-        self.hr_files = []
-        for ext in self.extensions:
-            self.hr_files.extend(list(self.hr_dir.glob(f'*{ext}')))
-            self.hr_files.extend(list(self.hr_dir.glob(f'*{ext.upper()}')))
-        
-        # Sort the files to ensure deterministic behavior
-        self.hr_files = sorted(self.hr_files)
-        
-        print(f"Found {len(self.hr_files)} high-resolution images in {self.hr_dir}")
-        
-        # Basic transforms
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-        ])
-        
-        # Augmentation transforms for training
-        self.augment = transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-            transforms.RandomRotation(90),
-        ]) if split == 'train' else None
-        
-    def __len__(self):
-        return len(self.hr_files)
-    
-    def get_random_crop_params(self, img):
-        """Get random crop parameters for high-resolution image"""
-        w, h = img.size
-        th, tw = self.patch_size, self.patch_size
-        if w == tw and h == th:
-            return 0, 0, h, w
-        if w < tw or h < th:
-            # Handle images smaller than patch size by resizing
-            scale = max(tw / w, th / h) * 1.1  # Scale up with a small margin
-            new_w, new_h = int(w * scale), int(h * scale)
-            img = img.resize((new_w, new_h), Image.BICUBIC)
-            w, h = new_w, new_h
-        
-        i = random.randint(0, h - th)
-        j = random.randint(0, w - tw)
-        return i, j, th, tw, img
-    
-    def create_low_res(self, hr_img):
-        """Create low-resolution image by downscaling with bicubic interpolation"""
-        w, h = hr_img.size
-        lr_w, lr_h = w // self.scale_factor, h // self.scale_factor
-        lr_img = hr_img.resize((lr_w, lr_h), Image.BICUBIC)
-        return lr_img
-    
+        self.length = len(self.paths)
+        if mode == "train":
+            self.transform = transforms.Compose([
+                transforms.RandomCrop(self.patch_size),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomVerticalFlip(p=0.1),
+                transforms.ColorJitter(brightness=cfg["color_jitter_b"], contrast=cfg["color_jitter_c"]),
+                transforms.ToTensor(),
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.CenterCrop(self.patch_size), transforms.ToTensor()])
+
+    def _collect(self, root):
+        root = Path(root); paths = []
+        if root.exists():
+            for ext in self.EXTENSIONS:
+                paths.extend(str(p) for p in root.rglob(f"*{ext}"))
+        return sorted(paths)
+
+    def __len__(self): return self.length
+
     def __getitem__(self, idx):
+        path = self.paths[idx % len(self.paths)]
         try:
-            # Load high-resolution image
-            hr_path = self.hr_files[idx]
-            
-            # Open image with PIL
-            try:
-                hr_img = Image.open(hr_path).convert('RGB')
-            except Exception as e:
-                print(f"Error loading image: {e}")
-                # Return a random sample as fallback
-                return self.__getitem__(random.randint(0, len(self) - 1))
-            
-            # Random crop for training
-            if self.split == 'train':
-                # Handle random cropping with potential resizing
-                i, j, h, w, hr_img_resized = self.get_random_crop_params(hr_img)
-                if hr_img_resized is not hr_img:  # If image was resized
-                    hr_img = hr_img_resized
-                
-                # Crop high-resolution image
-                hr_img = hr_img.crop((j, i, j + w, i + h))
-                
-                # Apply augmentation
-                if random.random() > 0.5 and self.augment:
-                    hr_img = self.augment(hr_img)
-            
-            # Create low-resolution version
-            lr_img = self.create_low_res(hr_img)
-            
-            # Convert to tensors
-            hr_tensor = self.transform(hr_img)
-            lr_tensor = self.transform(lr_img)
-            
-            return lr_tensor, hr_tensor
-            
+            img = Image.open(path).convert("RGB")
+            w, h = img.size
+            if w < self.patch_size or h < self.patch_size:
+                resample_method = getattr(Image, 'Resampling', Image).BICUBIC
+                img = img.resize((max(w, self.patch_size), max(h, self.patch_size)), resample_method)
+            img_t = self.transform(img).clamp(0.0, 1.0) # Guaranteed 0-1
+            name = Path(path).stem
+            return {"image": img_t, "path": path, "name": name}
         except Exception as e:
-            print(f"Error processing image {idx}: {e}")
-            # Return a random sample as fallback
-            return self.__getitem__(random.randint(0, len(self) - 1))
+            # Strictly NO synthetic random tensors! Recursively find the next valid image.
+            return self.__getitem__((idx + 1) % len(self.paths))
 
 
-def create_dataloaders(root_dir_train, root_dir_val, batch_size=8, patch_size=256, scale_factor=4, num_workers=4):
-    """Create training and validation dataloaders for super-resolution"""
-    train_dataset = SuperLowDataset(root_dir_train, split='train', patch_size=patch_size, scale_factor=scale_factor)
-    val_dataset = SuperLowDataset(root_dir_val, split='train', patch_size=patch_size, scale_factor=scale_factor)
+class KodakDataset(Dataset):
+    """Standard 24-image Kodak benchmark dataset at full resolution."""
+    KODAK_BASE_URL = "http://r0k.us/graphics/kodak/kodak/"
+    EXTENSIONS     = {".png", ".jpg", ".jpeg"}
+
+    def __init__(self, root_dir: str, download: bool = True):
+        super().__init__()
+        self.root = Path(root_dir)
+        self.root.mkdir(parents=True, exist_ok=True)
+        if download:
+            self._download_if_needed()
+            
+        self.paths = sorted(p for p in self.root.rglob("*") if p.suffix.lower() in self.EXTENSIONS)
+        if len(self.paths) < 1:
+            raise RuntimeError("Kodak dataset is empty. Synthetic data fallback is strictly forbidden.")
+            
+        print(f"[KodakDataset] {len(self.paths)} images found in {self.root}")
+        self.transform = transforms.ToTensor()
+
+    def _download_if_needed(self):
+        existing = list(self.root.glob("*.png")) + list(self.root.glob("*.jpg"))
+        if len(existing) >= 24:
+            return
+        print("[KodakDataset] Downloading Kodak images …")
+        for i in range(1, 25):
+            fname = f"kodim{i:02d}.png"; fpath = self.root / fname
+            if fpath.exists(): continue
+            try:
+                urllib.request.urlretrieve(self.KODAK_BASE_URL + fname, fpath)
+            except Exception as e:
+                print(f"  ✗ {fname}: {e}")
+
+    def __len__(self): return len(self.paths)
+
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        img  = Image.open(path).convert("RGB")
+        img_t = self.transform(img).clamp(0.0, 1.0) # Guaranteed 0-1
+        return {"image": img_t, "path": str(path), "name": path.stem}
+
+
+def build_dataloaders(cfg):
+    full_ds = ImageDataset(cfg["data_dir"], cfg)
+    n = len(full_ds)
+    n_train = int(n * cfg["train_ratio"]); n_val = int(n * cfg["val_ratio"])
+    n_test  = n - n_train - n_val
+    g = torch.Generator().manual_seed(cfg["seed"])
+    train_ds, val_ds, test_ds = random_split(full_ds, [n_train, n_val, n_test], generator=g)
     
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-    
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-    
-    return train_loader, val_loader
+    for ds, mode in [(val_ds, "val"), (test_ds, "test")]:
+        ds.dataset = copy.deepcopy(full_ds); ds.dataset.mode = mode
+        ds.dataset.transform = transforms.Compose([
+            transforms.CenterCrop(cfg["patch_size"]), transforms.ToTensor()])
+            
+    kw = dict(batch_size=cfg["batch_size"], num_workers=cfg["num_workers"], 
+              pin_memory=True, worker_init_fn=seed_worker)
+              
+    tl = DataLoader(train_ds, shuffle=True,  **kw)
+    vl = DataLoader(val_ds,   shuffle=False, **kw)
+    sl = DataLoader(test_ds,  shuffle=False, **kw)
+    print(f"[Dataset] train={len(train_ds)} | val={len(val_ds)} | test={len(test_ds)}")
+    return tl, vl, sl
